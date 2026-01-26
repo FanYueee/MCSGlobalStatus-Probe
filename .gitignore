@@ -1,0 +1,12 @@
+# Binaries
+mcsglobalstatus-probe
+mcsglobalstatus-probe.exe
+*.exe
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
