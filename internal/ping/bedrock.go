@@ -1,6 +1,7 @@
 package ping
 
 import (
+	"context"
 	"encoding/binary"
 	"math/rand"
 	"net"
@@ -36,11 +37,63 @@ func PingBedrock(host string, port int, timeout time.Duration) *BedrockStatus {
 		Port:   port,
 	}
 
+	// Check if host is already an IP address
+	isIP := net.ParseIP(host) != nil
+
+	// Quick validation: if not an IP and hostname looks invalid, fail fast
+	if !isIP {
+		// Single character or no dots = obviously invalid hostname
+		if len(host) < 4 || (!strings.Contains(host, ".") && len(host) < 10) {
+			status.Error = "Invalid hostname"
+			return status
+		}
+	}
+
 	startTime := time.Now()
 
-	conn, err := net.DialTimeout("udp", net.JoinHostPort(host, itoa(port)), timeout)
+	// Resolve hostname to IP first (UDP works better with IP addresses)
+	connectHost := host
+	if !isIP {
+		// Use goroutine with timeout for DNS resolution (more reliable than context)
+		type dnsResult struct {
+			ips []net.IPAddr
+			err error
+		}
+		resultChan := make(chan dnsResult, 1)
+
+		go func() {
+			resolver := &net.Resolver{}
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			ips, err := resolver.LookupIPAddr(ctx, host)
+			resultChan <- dnsResult{ips, err}
+		}()
+
+		select {
+		case result := <-resultChan:
+			if result.err != nil || len(result.ips) == 0 {
+				status.Error = "DNS resolution failed"
+				return status
+			}
+			// Prefer IPv4
+			for _, ip := range result.ips {
+				if ipv4 := ip.IP.To4(); ipv4 != nil {
+					connectHost = ipv4.String()
+					break
+				}
+			}
+			if connectHost == host && len(result.ips) > 0 {
+				connectHost = result.ips[0].IP.String()
+			}
+		case <-time.After(2 * time.Second):
+			status.Error = "DNS resolution timeout"
+			return status
+		}
+	}
+
+	conn, err := net.DialTimeout("udp", net.JoinHostPort(connectHost, itoa(port)), timeout)
 	if err != nil {
-		status.Error = err.Error()
+		status.Error = sanitizeError(err)
 		return status
 	}
 	defer conn.Close()
@@ -50,7 +103,7 @@ func PingBedrock(host string, port int, timeout time.Duration) *BedrockStatus {
 	// Send unconnected ping
 	pingPacket := createUnconnectedPing()
 	if _, err := conn.Write(pingPacket); err != nil {
-		status.Error = err.Error()
+		status.Error = sanitizeError(err)
 		return status
 	}
 
@@ -58,7 +111,7 @@ func PingBedrock(host string, port int, timeout time.Duration) *BedrockStatus {
 	buffer := make([]byte, 4096)
 	n, err := conn.Read(buffer)
 	if err != nil {
-		status.Error = err.Error()
+		status.Error = sanitizeError(err)
 		return status
 	}
 
