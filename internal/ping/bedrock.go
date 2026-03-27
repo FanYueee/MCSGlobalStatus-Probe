@@ -1,7 +1,6 @@
 package ping
 
 import (
-	"context"
 	"encoding/binary"
 	"math/rand"
 	"net"
@@ -23,6 +22,7 @@ type BedrockStatus struct {
 	Online  bool     `json:"online"`
 	Host    string   `json:"host"`
 	Port    int      `json:"port"`
+	IpInfo  *IpInfo  `json:"ip_info,omitempty"`
 	Version *Version `json:"version,omitempty"`
 	Players *Players `json:"players,omitempty"`
 	Motd    *Motd    `json:"motd,omitempty"`
@@ -54,40 +54,34 @@ func PingBedrock(host string, port int, timeout time.Duration) *BedrockStatus {
 	// Resolve hostname to IP first (UDP works better with IP addresses)
 	connectHost := host
 	if !isIP {
-		// Use goroutine with timeout for DNS resolution (more reliable than context)
 		type dnsResult struct {
-			ips []net.IPAddr
-			err error
+			snapshot *dnsSnapshot
+			err      error
 		}
 		resultChan := make(chan dnsResult, 1)
 
 		go func() {
-			resolver := &net.Resolver{}
-			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-			defer cancel()
-			ips, err := resolver.LookupIPAddr(ctx, host)
-			resultChan <- dnsResult{ips, err}
+			snapshot, err := resolveBedrockSnapshot(host, port, 2*time.Second)
+			resultChan <- dnsResult{snapshot: snapshot, err: err}
 		}()
 
 		select {
 		case result := <-resultChan:
-			if result.err != nil || len(result.ips) == 0 {
+			if result.snapshot != nil {
+				status.IpInfo = result.snapshot.IPInfo
+			}
+			if result.err != nil || result.snapshot == nil {
 				status.Error = "DNS resolution failed"
 				return status
 			}
-			// Prefer IPv4
-			for _, ip := range result.ips {
-				if ipv4 := ip.IP.To4(); ipv4 != nil {
-					connectHost = ipv4.String()
-					break
-				}
-			}
-			if connectHost == host && len(result.ips) > 0 {
-				connectHost = result.ips[0].IP.String()
-			}
+			connectHost = result.snapshot.ConnectHost
 		case <-time.After(2 * time.Second):
 			status.Error = "DNS resolution timeout"
 			return status
+		}
+	} else {
+		status.IpInfo = &IpInfo{
+			IP: host,
 		}
 	}
 

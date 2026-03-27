@@ -2,7 +2,6 @@ package ping
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"fmt"
 	"html"
@@ -18,15 +17,16 @@ import (
 const ProtocolVersion = 767 // 1.21.1
 
 type JavaStatus struct {
-	Online   bool        `json:"online"`
-	Host     string      `json:"host"`
-	Port     int         `json:"port"`
-	Version  *Version    `json:"version,omitempty"`
-	Players  *Players    `json:"players,omitempty"`
-	Motd     *Motd       `json:"motd,omitempty"`
-	Favicon  string      `json:"favicon,omitempty"`
-	Latency  int64       `json:"latency,omitempty"`
-	Error    string      `json:"error,omitempty"`
+	Online  bool     `json:"online"`
+	Host    string   `json:"host"`
+	Port    int      `json:"port"`
+	IpInfo  *IpInfo  `json:"ip_info,omitempty"`
+	Version *Version `json:"version,omitempty"`
+	Players *Players `json:"players,omitempty"`
+	Motd    *Motd    `json:"motd,omitempty"`
+	Favicon string   `json:"favicon,omitempty"`
+	Latency int64    `json:"latency,omitempty"`
+	Error   string   `json:"error,omitempty"`
 }
 
 type Version struct {
@@ -106,62 +106,38 @@ func PingJava(host string, port int, timeout time.Duration) *JavaStatus {
 	connectPort := port
 
 	if !isIP {
-		// Use goroutine with timeout for DNS resolution (more reliable than context)
 		type dnsResult struct {
-			connectHost string
-			connectPort int
-			err         error
+			snapshot *dnsSnapshot
+			err      error
 		}
 		resultChan := make(chan dnsResult, 1)
 
 		go func() {
-			resolver := &net.Resolver{}
-			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-			defer cancel()
-
-			connHost := host
-			connPort := port
-
-			// Try SRV first
-			_, addrs, err := resolver.LookupSRV(ctx, "minecraft", "tcp", host)
-			if err == nil && len(addrs) > 0 {
-				connHost = strings.TrimSuffix(addrs[0].Target, ".")
-				connPort = int(addrs[0].Port)
-			}
-
-			// If connectHost is still the original host (no SRV), we need to resolve A/AAAA
-			if connHost == host {
-				ips, err := resolver.LookupIPAddr(ctx, host)
-				if err != nil || len(ips) == 0 {
-					resultChan <- dnsResult{"", 0, fmt.Errorf("DNS resolution failed")}
-					return
-				}
-				// Prefer IPv4
-				for _, ip := range ips {
-					if ipv4 := ip.IP.To4(); ipv4 != nil {
-						connHost = ipv4.String()
-						break
-					}
-				}
-				if connHost == host && len(ips) > 0 {
-					connHost = ips[0].IP.String()
-				}
-			}
-
-			resultChan <- dnsResult{connHost, connPort, nil}
+			snapshot, err := resolveJavaSnapshot(host, port, 2*time.Second)
+			resultChan <- dnsResult{snapshot: snapshot, err: err}
 		}()
 
 		select {
 		case result := <-resultChan:
-			if result.err != nil {
+			if result.snapshot != nil {
+				status.IpInfo = result.snapshot.IPInfo
+				if result.snapshot.ConnectPort != 0 {
+					status.Port = result.snapshot.ConnectPort
+				}
+			}
+			if result.err != nil || result.snapshot == nil {
 				status.Error = "DNS resolution failed"
 				return status
 			}
-			connectHost = result.connectHost
-			connectPort = result.connectPort
+			connectHost = result.snapshot.ConnectHost
+			connectPort = result.snapshot.ConnectPort
 		case <-time.After(2 * time.Second):
 			status.Error = "DNS resolution timeout"
 			return status
+		}
+	} else {
+		status.IpInfo = &IpInfo{
+			IP: host,
 		}
 	}
 
@@ -175,7 +151,7 @@ func PingJava(host string, port int, timeout time.Duration) *JavaStatus {
 	conn.SetDeadline(time.Now().Add(timeout))
 
 	// Send handshake with original host (important for proxies like TCPShield)
-	handshake := createHandshake(host, port)
+	handshake := createHandshake(host, connectPort)
 	if _, err := conn.Write(handshake); err != nil {
 		status.Error = sanitizeError(err)
 		return status
