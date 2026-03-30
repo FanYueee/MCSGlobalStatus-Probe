@@ -20,9 +20,10 @@ func main() {
 	// Get secret from environment if not provided
 	if *secret == "" {
 		*secret = os.Getenv("PROBE_SECRET")
-		if *secret == "" {
-			*secret = "default-secret"
-		}
+	}
+
+	if *secret == "" {
+		log.Fatal("Probe secret is required. Provide -secret or set PROBE_SECRET.")
 	}
 
 	log.Printf("Starting MCSAPI Probe")
