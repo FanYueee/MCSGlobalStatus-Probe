@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -27,20 +28,29 @@ type Result struct {
 	Latency int64       `json:"latency,omitempty"`
 }
 
+type Heartbeat struct {
+	Type      string `json:"type"`
+	Timestamp string `json:"timestamp,omitempty"`
+}
+
 type Client struct {
-	serverURL string
-	nodeID    string
-	region    string
-	secret    string
-	conn      *websocket.Conn
+	serverURL     string
+	nodeID        string
+	region        string
+	secret        string
+	conn          *websocket.Conn
+	connMu        sync.RWMutex
+	writeMu       sync.Mutex
+	heartbeatStop chan struct{}
 }
 
 func NewClient(serverURL, nodeID, region, secret string) *Client {
 	return &Client{
-		serverURL: serverURL,
-		nodeID:    nodeID,
-		region:    region,
-		secret:    secret,
+		serverURL:     serverURL,
+		nodeID:        nodeID,
+		region:        region,
+		secret:        secret,
+		heartbeatStop: make(chan struct{}),
 	}
 }
 
@@ -55,14 +65,22 @@ func (c *Client) Connect() error {
 		return fmt.Errorf("failed to connect: %w", err)
 	}
 
-	c.conn = conn
+	c.setConn(conn)
 	log.Printf("Connected to controller: %s", c.serverURL)
 	return nil
 }
 
 func (c *Client) Run() {
+	go c.heartbeatLoop()
+
 	for {
-		_, message, err := c.conn.ReadMessage()
+		conn := c.getConn()
+		if conn == nil {
+			c.reconnect()
+			continue
+		}
+
+		_, message, err := conn.ReadMessage()
 		if err != nil {
 			log.Printf("Read error: %v", err)
 			c.reconnect()
@@ -118,8 +136,33 @@ func (c *Client) sendResult(result Result) {
 		return
 	}
 
-	if err := c.conn.WriteMessage(websocket.TextMessage, data); err != nil {
+	if err := c.writeMessage(data); err != nil {
 		log.Printf("Failed to send result: %v", err)
+	}
+}
+
+func (c *Client) heartbeatLoop() {
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			heartbeat := Heartbeat{
+				Type:      "heartbeat",
+				Timestamp: time.Now().UTC().Format(time.RFC3339),
+			}
+			data, err := json.Marshal(heartbeat)
+			if err != nil {
+				log.Printf("Failed to marshal heartbeat: %v", err)
+				continue
+			}
+			if err := c.writeMessage(data); err != nil {
+				log.Printf("Failed to send heartbeat: %v", err)
+			}
+		case <-c.heartbeatStop:
+			return
+		}
 	}
 }
 
@@ -139,7 +182,47 @@ func (c *Client) reconnect() {
 }
 
 func (c *Client) Close() {
+	select {
+	case <-c.heartbeatStop:
+	default:
+		close(c.heartbeatStop)
+	}
+
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	c.connMu.Lock()
+	defer c.connMu.Unlock()
 	if c.conn != nil {
 		c.conn.Close()
+		c.conn = nil
 	}
+}
+
+func (c *Client) getConn() *websocket.Conn {
+	c.connMu.RLock()
+	defer c.connMu.RUnlock()
+	return c.conn
+}
+
+func (c *Client) setConn(conn *websocket.Conn) {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	c.connMu.Lock()
+	defer c.connMu.Unlock()
+	if c.conn != nil && c.conn != conn {
+		c.conn.Close()
+	}
+	c.conn = conn
+}
+
+func (c *Client) writeMessage(data []byte) error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+
+	conn := c.getConn()
+	if conn == nil {
+		return fmt.Errorf("not connected")
+	}
+
+	return conn.WriteMessage(websocket.TextMessage, data)
 }
